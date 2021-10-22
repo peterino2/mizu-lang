@@ -5,8 +5,9 @@ const ArrayList = std.ArrayList;
 const mem = std.mem;
 
 /// Gregex - peter's ghetto regex implementation.
-///
-/// 
+/// todo:
+///     oneOrMore match mode is completely broken and i'm not entirely sure why
+///     it might be worth completely rewriting this one from scratch.
 const GRegexRepeatMode = enum {
     zeroOrMore,
     oneOrMore,
@@ -157,21 +158,30 @@ const GRegexObject = struct {
                 var pos: usize = 0;
                 var backstop_offset: usize = 0;
                 switch (repeating_group.repeat_mode) {
-                    GRegexRepeatMode.zeroOrMore => {
+                    GRegexRepeatMode.zeroOrMore, GRegexRepeatMode.oneOrMore => {
                         var is_matching: bool = true;
                         var backstop_match_size: usize = 0;
                         // find the backstop
                         var backstop: ?*const GRegexObject = null;
-                        for (next_objects) |*potential_backstop| {
-                            if (potential_backstop.is_backstop()) {
-                                backstop = potential_backstop;
-                                // potential_backstop.pretty_print(0, std.debug.print);
-                                break;
+                        if (next_objects.len > 1) {
+                            for (next_objects[1..]) |*potential_backstop| {
+                                if (potential_backstop.is_backstop()) {
+                                    backstop = potential_backstop;
+                                    // potential_backstop.pretty_print(0, std.debug.print);
+                                    break;
+                                }
+                                backstop_offset += 1;
                             }
-                            backstop_offset += 1;
                         }
 
                         if (backstop_offset > 0) backstop_offset -= 1;
+
+                        if (GRegexRepeatMode.oneOrMore == repeating_group.repeat_mode) {
+                            var inner_match = repeating_group.group.items[0].match(src[0..], next_objects);
+                            if (!inner_match.is_match) {
+                                return no_match;
+                            }
+                        }
 
                         while (is_matching and pos < src.len) {
                             for (repeating_group.group.items) |regex_obj, i| {
@@ -202,12 +212,9 @@ const GRegexObject = struct {
                                 pos -= 1;
                             }
                         }
-
                         match_obj.is_match = true;
-                        //match_obj.data = src[0..(pos - backstop_match_size)];
                         match_obj.data = src[0..pos];
                     },
-                    GRegexRepeatMode.oneOrMore => {},
                     GRegexRepeatMode.zeroOrOne => {
                         for (repeating_group.group.items) |regex_obj, i| {
                             match_obj = regex_obj.match(src[pos..], next_objects);
@@ -686,6 +693,16 @@ fn test_compile_inner(src: []const u8, alloc: *std.mem.Allocator, comptime shoul
     try compiled.pretty_print(if (should_print) std.debug.print else test_noprint);
 }
 
+pub fn test_nomatch(re_str: []const u8, test_str: []const u8, alloc: *std.mem.Allocator) !void {
+    var compiled = try ReParser.compile(re_str, alloc);
+    defer compiled.deinit();
+    var match = compiled.findstr_once(test_str);
+    if (match.len > 0) {
+        std.debug.print("Assert Failed, it actually matched, {s} => {s}", .{ re_str, test_str });
+    }
+    try expect(match.len == 0);
+}
+
 pub fn test_match(re_str: []const u8, test_str: []const u8, alloc: *std.mem.Allocator, assert_len: usize) !void {
     var compiled = try ReParser.compile(re_str, alloc);
     defer compiled.deinit();
@@ -719,8 +736,11 @@ test "ipc_repeating_groups" {
 
     try test_match("lmao:x?", "hfjdkahfls lmao:x text", alloc, 6);
     try test_match("lmao:x*", "hfjdkahfls lmao:xxt text", alloc, 7);
-    try test_match("lmao:.*", "hfjdkahfls lmao:xxt text", alloc, 13);
+    try test_match("lmao:x+", "hfjdkahfls lmao:xxt text", alloc, 7);
+    try test_match("lmao:x+", "hfjdkahfls lmao:xxxxxt text", alloc, 10);
+    try test_match("lmao:.*", "hfjdkahfls\n lmao:xxt text", alloc, 13);
     try test_match("lmao:x?", "fhjdaklfhsdjkal lmao: text", alloc, 5);
+    try test_nomatch("lmao:x+", " dfjsaf lmao:yx c", alloc);
 }
 
 test "epc_orgroup_matching" {
