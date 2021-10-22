@@ -39,21 +39,23 @@ modules of a target language and runtime.
 The basic mode of operation is to emit portable C99 code, and should be suitable 
 for any kind of systems level task.
 
-# Language description and examples
+```{toctree}
+podtypes_and_procs
+data_types
+```
+
+# A rich and complete mizu object example
 
 An example program written in mizu, this provides an API that performs a
 transformation of object positions based on the current camera position, 
-gets some debug information 
-
-
-# Rich sketch
+gets some debug information.
 
 ```{code-block} rust
 cache_size: const isize = @'CacheSize();
 
 api HelloMizu {
 
-    dataset Vector2 {
+    struct Vector2 {
         x : i32;
         y : i32;
         proc @'op_sub(@'self, other: ref Vector2) -> Vector2
@@ -73,11 +75,11 @@ api HelloMizu {
         }
     }
 
-    dataset Rect {
+    struct Rect {
         position : Vector2,
         size : Vector2,
     }
-    dataset View Rect;
+    struct View Rect;
 
     module CanvasObjects
     {
@@ -104,6 +106,10 @@ api HelloMizu {
                 render_position = position - view.position;
                 render_bottom_left = render_position + size;
             }
+        }
+
+        flow check_visible {
+            // outside of a block, the code can be thought of as running in parallel
             visible = {
                 if position.x > (view.position.x + view.size.x) or
                    position.y > (view.position.y + view.size.y) or
@@ -118,12 +124,6 @@ api HelloMizu {
             }
         }
 
-        flow check_visible {
-
-            // outside of a block, the code can be thought of as running in parallel
-        }
-    }
-
         // dirty flows and flows with priority = low
         // do not contribute to data packing hints and are naive
         dirty flow update
@@ -134,7 +134,7 @@ api HelloMizu {
             }
         }
 
-        proc find_canvas_by_name(name: CharStr) -> mut ref CanvasObject
+        proc find_canvas_by_name(name: CharStr) -> mut ref CanvasObjects.data
         {
             for object in @'ContextData(canvas_object)
             {

@@ -1,4 +1,4 @@
-# Mizulang (Aka. mizu): a Data Oriented Language
+# Mizulang (Aka. mizu): a Data Oriented Language -- WIP, go away!
 
 To build the documentation run `make_docs.py`
 
