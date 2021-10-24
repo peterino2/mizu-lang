@@ -4,10 +4,45 @@ const dir: fs.Dir = fs.cwd();
 const ArrayList = std.ArrayList;
 const mem = std.mem;
 
-/// Gregex - peter's ghetto regex implementation.
-/// todo:
-///     oneOrMore match mode is completely broken and i'm not entirely sure why
-///     it might be worth completely rewriting this one from scratch.
+// ------------------------------ Simple public API -----------------------
+
+// Finds first math, returns a char slice
+pub fn re_findstr_once(re_str: []const u8, src: []const u8, allocator: *std.mem.Allocator) ![]const u8 {
+    var compiled = try ReParser.compile(re_str, allocator);
+    defer compiled.deinit();
+    return compiled.findstr_once(src);
+}
+
+// remember to invoke the ReMatch.deinit() function
+pub fn re_find_once(re_str: []const u8, src: []const u8, allocator: *std.mem.Allocator) !ReMatch {
+    var compiled = try ReParser.compile(re_str, allocator);
+    defer compiled.deinit();
+    return compiled.find_once(src, allocator);
+}
+
+// public use case examples
+
+test "usecase_simple" {
+    const should_print: bool = true;
+    const print = if (should_print) std.debug.print else test_noprint;
+    var alloc = std.heap.page_allocator;
+
+    var test_restr = "name: *(.*)\\(.*\\)$";
+
+    var find = try re_find_once(test_restr, "date: 2077-06-24 name: adam jensen (occupation: killa)\n", alloc);
+    defer find.deinit(); // find has an arraylist of regex objects, this should be de-initialized when out of scope.
+
+    print("find = '{s}':\n", .{find.text}); //
+    print("find = '{s}':\n", .{find.groups.items[0].text});
+    try expect(find.groups.items[0].text.len == "adam jensen".len);
+    std.debug.assert(std.mem.eql(u8, "adam jensen", find.groups.items[0].text));
+}
+
+// more features to add:
+// nTimes support
+// invert support
+
+// ----------------------------- Internal -------------------
 const GRegexRepeatMode = enum {
     zeroOrMore,
     oneOrMore,
@@ -35,6 +70,22 @@ const GRegexObject = struct {
     pub fn make_match_group(allocator: *std.mem.Allocator) ReCompileObjectError!GRegexObject {
         var rv: GRegexObject = .{ .inner = .{ .matchGroup = ArrayList(GRegexObject).init(allocator) } };
         return rv;
+    }
+
+    pub fn make_line_end(allocator: *std.mem.Allocator) ReCompileObjectError!GRegexObject {
+        var regex_obj = GRegexObject.make_orgroup(allocator);
+        var ored_groups = [_]GRegexObject{
+            .{ .inner = .{ .single = "\n" } },
+            .{ .inner = .{ .matchGroup = ArrayList(GRegexObject).init(allocator) } },
+        };
+        try ored_groups[1].inner.matchGroup.append(GRegexObject{ .inner = .{ .single = "\r" } });
+        try ored_groups[1].inner.matchGroup.append(GRegexObject{ .inner = .{ .single = "\n" } });
+
+        for (ored_groups) |obj, i| {
+            try regex_obj.inner.orgroup.append(obj);
+        }
+
+        return regex_obj;
     }
 
     pub fn make_alphanumeric(allocator: *std.mem.Allocator) ReCompileObjectError!GRegexObject {
@@ -107,14 +158,41 @@ const GRegexObject = struct {
         backstop_offset: usize = 0,
     };
 
-    pub fn is_backstop(self: *const GRegexObject) bool {
-        switch (self.*.inner) {
+    pub fn equals(self: GRegexObject, other: GRegexObject) bool {
+        return false;
+    }
+
+    pub fn is_backstop(self: GRegexObject, for_obj: *const GRegexObject) bool {
+        // std.debug.print("checking backstop:", .{});
+        // self.pretty_print(0, std.debug.print);
+        switch (self.inner) {
             .range => return true,
             .single => return true,
-            .matchGroup => return true,
+            .matchGroup => |*match_group| {
+                if (match_group.items.len > 0) {
+                    return match_group.items[0].is_backstop(for_obj);
+                }
+                return true;
+            },
             .orgroup => return true,
             .repeatingGroup => |*group| {
                 if (group.repeat_mode == GRegexRepeatMode.zeroOrOne or group.repeat_mode == GRegexRepeatMode.zeroOrMore) {
+                    switch (for_obj.inner) {
+                        .repeatingGroup => |*for_group| {
+                            if (group.group.items.len != for_group.group.items.len) {
+                                return true;
+                            }
+                            var i: u32 = 0;
+                            while (i < group.group.items.len) : (i += 1) {
+                                var left = group.group.items[i];
+                                var right = for_group.group.items[i];
+                                if (!left.equals(right)) {
+                                    return true;
+                                }
+                            }
+                        },
+                        else => return false,
+                    }
                     return false;
                 }
                 return true;
@@ -122,8 +200,9 @@ const GRegexObject = struct {
         }
     }
 
-    pub fn match(self: *const GRegexObject, src: []const u8, next_objects: []const GRegexObject) MatchObject {
+    pub fn match(self: *const GRegexObject, src: []const u8, next_objects: []const GRegexObject) ReSearchError!MatchObject {
         const no_match = MatchObject{ .data = "", .is_match = false };
+        // self.pretty_print(0, std.debug.print);
 
         switch (self.*.inner) {
             .range => |range| {
@@ -141,7 +220,9 @@ const GRegexObject = struct {
             },
             .orgroup => |orgroup| {
                 for (orgroup.items) |regex_obj, i| {
-                    var match_obj = regex_obj.match(src, next_objects);
+                    var next_objects_start: usize = 0;
+                    if (next_objects.len > 0) next_objects_start = 1;
+                    var match_obj = try regex_obj.match(src, next_objects[next_objects_start..]);
                     if (match_obj.is_match) {
                         return match_obj;
                     }
@@ -150,8 +231,40 @@ const GRegexObject = struct {
             .matchGroup => |match_group| {
                 var match_obj = MatchObject{ .data = "", .is_match = false };
                 var pos: usize = 0;
+                var matches: bool = true;
 
-                for (match_group.items) |regex_obj| {}
+                for (match_group.items) |regex_obj, index| {
+                    var start_index: usize = if (match_group.items.len > 1) 1 else 0;
+                    // check if we're the final object. if it's the back last object then use the higher scope
+                    // next_objects instead of the next ones in this specific regex_obj
+                    var inner_next_obj = if (index < (match_group.items.len - 1)) match_group.items[start_index..] else next_objects;
+
+                    // if (inner_next_obj.len > 0) {
+                    //     std.debug.print("this: ", .{});
+                    //     self.pretty_print(0, std.debug.print);
+                    //     std.debug.print("\n", .{});
+
+                    //     std.debug.print("next: ", .{});
+                    //     inner_next_obj[0].pretty_print(0, std.debug.print);
+                    //     std.debug.print("\n", .{});
+                    // }
+
+                    var match_inner = try regex_obj.match(src[pos..], inner_next_obj);
+                    if (match_inner.is_match) {
+                        pos += match_inner.data.len;
+                    } else {
+                        matches = false;
+                    }
+                }
+
+                if (matches) {
+                    match_obj.data = src[0..pos];
+                    match_obj.is_match = true;
+                }
+
+                // std.debug.print("match group = '{s}' src= {s}\n", .{ match_obj.data, src });
+
+                return match_obj;
             },
             .repeatingGroup => |repeating_group| {
                 var match_obj = MatchObject{ .data = "", .is_match = false };
@@ -161,23 +274,31 @@ const GRegexObject = struct {
                     GRegexRepeatMode.zeroOrMore, GRegexRepeatMode.oneOrMore => {
                         var is_matching: bool = true;
                         var backstop_match_size: usize = 0;
-                        // find the backstop
                         var backstop: ?*const GRegexObject = null;
                         if (next_objects.len > 1) {
                             for (next_objects[1..]) |*potential_backstop| {
-                                if (potential_backstop.is_backstop()) {
+                                if (potential_backstop.is_backstop(self)) {
                                     backstop = potential_backstop;
-                                    // potential_backstop.pretty_print(0, std.debug.print);
+                                    switch (potential_backstop.inner) {
+                                        .matchGroup => |*match_group| {
+                                            if (match_group.items.len > 0) {
+                                                backstop = &match_group.items[0];
+                                            }
+                                        },
+                                        else => {},
+                                    }
+                                    // std.debug.print("Using backstop:\n", .{});
+                                    // if (backstop) |b| b.pretty_print(0, std.debug.print);
                                     break;
                                 }
                                 backstop_offset += 1;
                             }
                         }
 
-                        if (backstop_offset > 0) backstop_offset -= 1;
+                        if (backstop_offset > 0) backstop_offset = 0;
 
                         if (GRegexRepeatMode.oneOrMore == repeating_group.repeat_mode) {
-                            var inner_match = repeating_group.group.items[0].match(src[0..], next_objects);
+                            var inner_match = try repeating_group.group.items[0].match(src[0..], next_objects[1..]);
                             if (!inner_match.is_match) {
                                 return no_match;
                             }
@@ -185,28 +306,41 @@ const GRegexObject = struct {
 
                         while (is_matching and pos < src.len) {
                             for (repeating_group.group.items) |regex_obj, i| {
-                                // check if it's the backstop
-                                if (backstop) |b| {
-                                    var backstop_match = b.match(src[pos..], next_objects);
-                                    if (backstop_match.is_match) {
-                                        is_matching = false;
-                                        backstop_match_size = backstop_match.data.len;
-                                        break;
-                                    }
-                                }
-
-                                match_obj = regex_obj.match(src[pos..], next_objects);
+                                match_obj = try regex_obj.match(src[pos..], next_objects[1..]);
                                 if (match_obj.is_match) {
                                     pos += match_obj.data.len;
                                 } else {
                                     is_matching = false;
-                                    pos += 1;
-                                    break;
+                                    // std.debug.print("inner object failed to match \n", .{});
+                                    // regex_obj.pretty_print(0, std.debug.print);
+                                }
+
+                                // check if it's the backstop
+                                if (backstop) |b| {
+                                    var backstop_match = no_match;
+                                    // switch (b.inner) {
+                                    //     .matchGroup => |*group| {
+                                    //         if (group.items.len > 0) {
+                                    //             backstop_match = try group.items[0].match(src[pos..], next_objects[1..]);
+                                    //         }
+                                    //     },
+                                    //     else => {
+                                    //         backstop_match = try b.match(src[pos..], next_objects[1..]);
+                                    //     },
+                                    // }
+                                    backstop_match = try b.match(src[pos..], next_objects[1..]);
+                                    if (backstop_match.is_match) {
+                                        is_matching = false;
+                                        backstop_match_size = backstop_match.data.len;
+                                        // std.debug.print("backstop_found ", .{});
+                                        // b.pretty_print(0, std.debug.print);
+                                        break;
+                                    }
                                 }
                             }
                         }
                         if (backstop) |_| {
-                            match_obj.backstop_offset = backstop_offset;
+                            match_obj.backstop_offset = 0;
                         } else {
                             if (pos < src.len) {
                                 pos -= 1;
@@ -217,7 +351,7 @@ const GRegexObject = struct {
                     },
                     GRegexRepeatMode.zeroOrOne => {
                         for (repeating_group.group.items) |regex_obj, i| {
-                            match_obj = regex_obj.match(src[pos..], next_objects);
+                            match_obj = try regex_obj.match(src[pos..], next_objects[1..]);
                             if (match_obj.is_match) {
                                 pos += match_obj.data.len;
                             } else {
@@ -285,7 +419,7 @@ const GRegexObject = struct {
                 }
             },
             .range => |inner| {
-                print("{s}'{c}' - '{c}'\n", .{ invert_char, inner.min, inner.max });
+                print("{s}'{c}(0x{x})' -> '{c}(0x{x})'\n", .{ invert_char, inner.min, inner.min, inner.max, inner.max });
             },
             .orgroup => |inner| {
                 print("{s}OrGroup:\n", .{invert_char});
@@ -294,33 +428,35 @@ const GRegexObject = struct {
                     regex_obj.pretty_print(indent, print);
                 }
             },
-            // else => print("unknown regex_obj\n", .{}),
         }
     }
 };
 
-const ReCompileError = error{ UnexpectedToken, UnhandledError, NotImplementedError, UnclosedGroupRegex };
+const ReCompileError = error{ UnexpectedToken, UnhandledError, NotImplementedError, UnclosedGroupRegex, NestedMatchGroup };
 
 const ReCompileObjectError = ReCompileError || error{OutOfMemory};
 
-const ReSearchError = error{NotFoundError} || error{NotImplementedError};
+const ReSearchError = error{NotFoundError} || error{NotImplementedError} || error{DebugError};
 
 const ReMatchGroup = struct {
     text: []const u8,
-    pos: u32,
+    pos: usize,
 };
 
 const ReMatch = struct {
     text: []const u8,
+    is_match: bool = true,
     groups: ArrayList(ReMatchGroup),
-    pos: u32,
     alloc: *std.mem.Allocator,
 
-    pub fn init(alloc: *std.mem.Allocator) !void {
-        return .{
+    pub fn deinit(self: *ReMatch) void {
+        self.groups.deinit();
+    }
+
+    pub fn init(alloc: *std.mem.Allocator) !ReMatch {
+        return ReMatch{
             .text = "",
-            .groups = try ArrayList([]const u8).init(alloc),
-            .pos = 0,
+            .groups = ArrayList(ReMatchGroup).init(alloc),
             .alloc = alloc,
         };
     }
@@ -379,21 +515,15 @@ const ReParser = struct {
         pos: usize,
     };
 
-    fn make_regex_obj_from_ctx(self: *ReParser, ctx: *ReParserBuilderContext) ReCompileObjectError!GRegexObject {
+    fn make_regex_obj_from_ctx(self: *ReParser, ctx: *ReParserBuilderContext, active_group: ?*GRegexObject) ReCompileObjectError!GRegexObject {
         const print = std.debug.print;
+        // print("making inner_context for {s}, full={s}\n", .{ ctx.spec[ctx.pos..], ctx.spec });
         switch (ctx.spec[ctx.pos]) {
             '.' => {
-                var ored_groups = [_]GRegexObject{
-                    .{ .inner = .{ .range = .{ .min = 1, .max = 255 } } },
-                };
-
-                var push_obj: GRegexObject = GRegexObject.make_orgroup(self.allocator);
-                for (ored_groups) |regex_obj| {
-                    try push_obj.inner.orgroup.append(regex_obj);
-                }
+                var push_obj: GRegexObject = .{ .inner = .{ .range = .{ .min = 1, .max = 255 } } };
                 return push_obj;
             },
-            'a'...'z', 'A'...'Z', '0'...'9', ':', ' ' => {
+            'a'...'z', 'A'...'Z', '0'...'9', ':', ' ', '\n', '\r', '\t' => {
                 // grab the next 3 characters to see if this is a range object
                 // there's likely a more elegant way to handle this kind of windowing
                 const max = if (ctx.pos + 3 < ctx.spec.len) ctx.pos + 3 else ctx.spec.len;
@@ -447,7 +577,7 @@ const ReParser = struct {
                     var or_group_obj = GRegexObject.make_orgroup(self.allocator);
 
                     while (sub_context.pos < sub_context.spec.len) : (sub_context.pos += 1) {
-                        var spec_obj = try self.make_regex_obj_from_ctx(&sub_context);
+                        var spec_obj = try self.make_regex_obj_from_ctx(&sub_context, null);
 
                         switch (spec_obj.inner) // !!todo; change this to a look ahead instead
                         {
@@ -469,6 +599,10 @@ const ReParser = struct {
                     print("   Slice: '{s}'", .{ctx.spec});
                     return ReCompileError.UnexpectedToken;
                 }
+            },
+            '$' => {
+                ctx.pos += 1;
+                return try GRegexObject.make_line_end(self.allocator);
             },
             '\\' => {
                 // this is an escape character, capture the next character and create a single match
@@ -508,7 +642,15 @@ const ReParser = struct {
                     ctx.pos += 1;
                     return regex_obj;
                 }
-                print("Unable to deduce escaped token", .{});
+                print("bad token:{c} at pos {d}\n", .{ ctx.spec[ctx.pos], ctx.pos });
+                print("    {s}\n", .{ctx.spec});
+                print("____", .{});
+                var i: u32 = 0;
+                while (i < ctx.pos) : (i += 1) {
+                    print("_", .{});
+                }
+                print("^", .{});
+
                 return ReCompileError.UnexpectedToken;
             },
 
@@ -520,22 +662,40 @@ const ReParser = struct {
             '{', // n_times
             => { // repeating case, zero or more
                 var re_group = try GRegexObject.make_repeating_group(ctx.spec[ctx.pos..], self.allocator);
+                var last_group = self.sequence_mem[self.len - 1];
+                if (active_group) |group| {
+                    last_group = group.inner.matchGroup.pop();
+                }
 
                 // pop last object, and add it to re_group
-                var last_group = self.sequence_mem[self.len - 1];
+                // std.debug.print("\n>>> patching_inner: \n", .{});
+                // last_group.pretty_print(0, std.debug.print);
+                // std.debug.print(">>> /patching \n\n", .{});
 
                 try re_group.inner.repeatingGroup.group.append(last_group);
                 return re_group; // return the repeating group
             },
             '(' => { // match group, create a new context from the inner
+                if (active_group != null) {
+                    return ReCompileError.NestedMatchGroup;
+                }
+
                 var rv = try GRegexObject.make_match_group(self.allocator);
                 var end_pos = ctx.pos;
+
+                var open_count: u32 = 1;
                 var found: bool = false;
                 for (ctx.spec[ctx.pos + 1 ..]) |character, index| {
+                    if (character == '(') {
+                        open_count += 1;
+                    }
                     if (character == ')') {
                         end_pos = ctx.pos + index + 1;
-                        found = true;
-                        break;
+                        open_count -= 1;
+                        if (open_count == 0) {
+                            found = true;
+                            break;
+                        }
                     }
                 }
                 if (found != true) {
@@ -547,15 +707,9 @@ const ReParser = struct {
                     .pos = 0,
                 };
 
+                // std.debug.print("\ninner_ctx.spec = {s}\n", .{inner_ctx.spec});
                 while (inner_ctx.pos < inner_ctx.spec.len) : (inner_ctx.pos += 1) {
-                    var spec_obj = try self.make_regex_obj_from_ctx(&inner_ctx);
-                    switch (spec_obj.inner) // !!todo; change this to a look ahead instead
-                    {
-                        .repeatingGroup => {
-                            self.len -= 1;
-                        },
-                        else => {},
-                    }
+                    var spec_obj = try self.make_regex_obj_from_ctx(&inner_ctx, &rv);
                     try rv.inner.matchGroup.append(spec_obj);
                 }
 
@@ -590,7 +744,7 @@ const ReParser = struct {
         // compile it via walking right and expanding a window
         var ctx: ReParserBuilderContext = .{ .pos = 0, .spec = spec };
         while (ctx.pos < ctx.spec.len) : (ctx.pos += 1) {
-            var spec_obj = try self.make_regex_obj_from_ctx(&ctx);
+            var spec_obj = try self.make_regex_obj_from_ctx(&ctx, null);
             switch (spec_obj.inner) // !!todo; change this to a look ahead instead
             {
                 .repeatingGroup => {
@@ -629,7 +783,7 @@ const ReParser = struct {
         }
     };
 
-    pub fn findstr_once(self: *const ReParser, src: []const u8) []const u8 {
+    pub fn findstr_once(self: *const ReParser, src: []const u8) ![]const u8 {
         var pos: usize = 0;
         while (pos < src.len) : (pos += 1) {
             var slice = src[pos..];
@@ -639,19 +793,21 @@ const ReParser = struct {
             var seq_id: usize = 0;
             while (seq_id < self.len) : (seq_id += 1) {
                 const regex_obj = self.sequence_mem[seq_id];
-                // std.debug.print("trying match for {s}", .{slice});
-                // regex_obj.pretty_print(1);
-                // std.debug.print("huh\n", .{});
-                var match = regex_obj.match(parse_context.slice(), self.sequence_mem[seq_id..self.len]);
+                //std.debug.print("trying match for '{s}'", .{parse_context.slice()});
+                //regex_obj.pretty_print(1);
+                //std.debug.print("huh\n", .{});
+                var match = try regex_obj.match(parse_context.slice(), self.sequence_mem[seq_id..self.len]);
 
                 if (!match.is_match) {
                     does_match = false;
+                    // std.debug.print("nomatch! {s} broken_match = \n", .{slice});
+                    regex_obj.pretty_print(0, std.debug.print);
                     break;
                 }
 
                 // returns a count of the number of characters this matches
                 if (match.is_match) {
-                    seq_id += match.backstop_offset;
+                    // seq_id += match.backstop_offset;
                     parse_context.pos += match.data.len;
                     // std.debug.print("len +{d} = {d} @off {}\n", .{ match.data.len, parse_context.pos, match.backstop_offset });
                     parse_context.match_size += match.data.len;
@@ -660,31 +816,77 @@ const ReParser = struct {
 
             if (does_match == true) {
                 return slice[0..parse_context.match_size];
+            } else {
+                // std.debug.print("nomatch2! {s} broken_match = \n", .{slice});
             }
         }
         return ""[0..0];
     }
 
-    pub fn find_all(self: ReParser, src: []const u8) !ArrayList(ReMatch) {
-        var rv = ArrayList(ReMatch).init();
+    // finds first instance of a match in the target string and places matches into a groups
+    // note this does not support nested groups
+    //
+    // this means you can't do .groups[0][0] in something like (lm(ao))
+    pub fn find_once(self: ReParser, src: []const u8, allocator: *std.mem.Allocator) !ReMatch {
+        var rv: ReMatch = try ReMatch.init(allocator);
 
+        var pos: usize = 0;
+
+        while (pos < src.len) : (pos += 1) {
+            var slice = src[pos..];
+            var does_match = true;
+            var parse_context = ParserContext.make(slice);
+
+            var seq_id: usize = 0;
+
+            while (seq_id < self.len) : (seq_id += 1) {
+                const regex_obj = self.sequence_mem[seq_id];
+                std.debug.print("trying match for '{s}'\n", .{parse_context.slice()});
+                var match = try regex_obj.match(parse_context.slice(), self.sequence_mem[seq_id..self.len]);
+                regex_obj.pretty_print(0, std.debug.print);
+                std.debug.print("matched! '{s}'\n", .{match.data});
+                std.debug.print("---\n", .{});
+
+                if (!match.is_match) {
+                    does_match = false;
+                    //std.debug.print("nomatch! {s} broken_match = \n", .{slice});
+                    // regex_obj.pretty_print(0, std.debug.print);
+                    break;
+                }
+
+                if (match.is_match) {
+                    // seq_id += match.backstop_offset;
+                    parse_context.pos += match.data.len;
+                    parse_context.match_size += match.data.len;
+                    switch (regex_obj.inner) {
+                        .matchGroup => |match_group| {
+                            var group_info: ReMatchGroup = .{ .pos = pos, .text = match.data };
+                            std.debug.print("adding group: {s}\n", .{match.data});
+                            try rv.push_group(group_info);
+                        },
+                        else => {},
+                    }
+                }
+            }
+
+            if (does_match == true) {
+                rv.text = slice[0..parse_context.match_size];
+                std.debug.print("Found results! {s}\n", .{rv.text});
+                return rv;
+            }
+        }
+
+        std.debug.print("Results not found! {s}\n", .{rv.text});
+        rv.text = "";
+        rv.is_match = false;
         return rv;
     }
 };
 
-fn test_noprint(comptime fmt: []const u8, args: anytype) void {}
+// Testing suite  below ------------------------------------
 
-// Finds first math, returns a char slice
-pub fn re_find_once(re_str: []const u8, src: []const u8, allocator: *std.mem.Allocator) ![]const u8 {
-    var compiled = try ReParser.compile(re_str, allocator);
-    defer compiled.deinit();
-    return compiled.findstr_once(src);
-}
-
-pub fn re_find(re_str: []const u8, src: []const u8, *std.mem.Allocator) !ArrayList(ReMatch) {
-    var compiled = try ReParser.compile(re_str, allocator);
-    defer compiled.deinit();
-    return compiled.find(src);
+fn test_noprint(comptime fmt: []const u8, args: anytype) void {
+    // this is a no-print used for testing
 }
 
 fn test_compile_inner(src: []const u8, alloc: *std.mem.Allocator, comptime should_print: bool) !void {
@@ -696,21 +898,56 @@ fn test_compile_inner(src: []const u8, alloc: *std.mem.Allocator, comptime shoul
 pub fn test_nomatch(re_str: []const u8, test_str: []const u8, alloc: *std.mem.Allocator) !void {
     var compiled = try ReParser.compile(re_str, alloc);
     defer compiled.deinit();
-    var match = compiled.findstr_once(test_str);
+    var match = try compiled.findstr_once(test_str);
     if (match.len > 0) {
         std.debug.print("Assert Failed, it actually matched, {s} => {s}", .{ re_str, test_str });
     }
     try expect(match.len == 0);
 }
 
+pub fn test_groups(
+    re_str: []const u8,
+    test_str: []const u8,
+    group0_str: []const u8,
+    group_count: usize,
+    alloc: *std.mem.Allocator,
+) !void {
+    var compiled = try ReParser.compile(re_str, alloc);
+    defer compiled.deinit();
+
+    var findstr = try compiled.findstr_once(test_str);
+    try expect(findstr.len > 0);
+    var rematch = try compiled.find_once(test_str, alloc);
+    defer rematch.deinit();
+
+    expect(std.mem.eql(u8, rematch.groups.items[0].text, group0_str)) catch {
+        std.debug.print("'{s}'\n!=\n'{s}'", .{ rematch.groups.items[0].text, group0_str });
+        @panic("Test Failed");
+    };
+    try expect(rematch.groups.items.len == group_count);
+}
+
 pub fn test_match(re_str: []const u8, test_str: []const u8, alloc: *std.mem.Allocator, assert_len: usize) !void {
     var compiled = try ReParser.compile(re_str, alloc);
     defer compiled.deinit();
-    var match = compiled.findstr_once(test_str);
+    var match = try compiled.findstr_once(test_str);
     if (match.len != assert_len) {
         std.debug.print("Assert Failed, matched length {d}, expected {d} string='{s}' \n", .{ match.len, assert_len, match });
     }
     try expect(match.len == assert_len);
+}
+
+test "ipc_testing_match_groups" {
+    const should_print: bool = false;
+    const print = if (should_print) std.debug.print else test_noprint;
+    defer print("/end \n", .{});
+    print("\n", .{});
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = &arena.allocator;
+
+    try test_groups("lm(ao)", "one two three lmao four", "ao", 1, alloc);
+    try test_groups("l(ma)o", "one two three lmao four", "ma", 1, alloc);
 }
 
 test "ipc_repeating_groups" {
@@ -726,9 +963,9 @@ test "ipc_repeating_groups" {
         var compiled = try ReParser.compile("lmao:.*", alloc);
         defer compiled.deinit();
         try compiled.pretty_print(print);
-        var match = try re_find_once("lmao:.*c", "lmao: wutangclan", alloc);
-        var match2 = try re_find_once("lmao:.*x", "lmao:tx", alloc);
-        var match3 = try re_find_once("lmao:.*x?y", "random lmao:ty text", alloc);
+        var match = try re_findstr_once("lmao:.*c", "lmao: wutangclan", alloc);
+        var match2 = try re_findstr_once("lmao:.*x", "lmao:tx", alloc);
+        var match3 = try re_findstr_once("lmao:.*x?y", "random lmao:ty text", alloc);
         try expect(match.len == 13);
         try expect(match2.len == 7);
         try expect(match3.len == match2.len);
@@ -740,6 +977,7 @@ test "ipc_repeating_groups" {
     try test_match("lmao:x+", "hfjdkahfls lmao:xxxxxt text", alloc, 10);
     try test_match("lmao:.*", "hfjdkahfls\n lmao:xxt text", alloc, 13);
     try test_match("lmao:x?", "fhjdaklfhsdjkal lmao: text", alloc, 5);
+    try test_match("(lm)ao", "fhjdaklfhsdjkal lmao: text", alloc, 4);
     try test_nomatch("lmao:x+", " dfjsaf lmao:yx c", alloc);
 }
 
@@ -748,10 +986,10 @@ test "epc_orgroup_matching" {
     defer arena.deinit();
     const alloc = &arena.allocator;
 
-    try expect((try re_find_once("p.ter", "peter", alloc)).len == 5);
-    try expect((try re_find_once("p.ter", "pater", alloc)).len == 5);
-    try expect((try re_find_once("p.ter", "p0ter", alloc)).len == 5);
-    try expect((try re_find_once("p[xyt]ter", "pyter", alloc)).len == 5);
+    try expect((try re_findstr_once("p.ter", "peter", alloc)).len == 5);
+    try expect((try re_findstr_once("p.ter", "pater", alloc)).len == 5);
+    try expect((try re_findstr_once("p.ter", "p0ter", alloc)).len == 5);
+    try expect((try re_findstr_once("p[xyt]ter", "pyter", alloc)).len == 5);
 }
 
 test "ipc_parse_strings" {
@@ -791,7 +1029,7 @@ test "ipc_compile_regex" {
     }
 
     {
-        var test_str = "0x[\\[abcdef]223"; // contains sequence nested orGroup sequences
+        var test_str = "0x[\\[abcdef]223";
         var compiled = try ReParser.compile(test_str, alloc);
         defer compiled.deinit();
         var i: usize = 0;
@@ -799,7 +1037,7 @@ test "ipc_compile_regex" {
     }
 
     {
-        var test_str = "0x[\\[abcdef]2+23"; // contains sequence nested orGroup sequences
+        var test_str = "0x[\\[abcdef]2+23";
         var compiled = try ReParser.compile(test_str, alloc);
         defer compiled.deinit();
         var i: usize = 0;
@@ -853,4 +1091,22 @@ test "ipc_compile_and_use_group_regex" {
         try compiled.pretty_print(print);
         defer compiled.deinit();
     }
+}
+
+test "epc_groups_and_conditionals" {
+    const should_print: bool = true;
+    const print = if (should_print) std.debug.print else test_noprint;
+    var alloc = std.heap.page_allocator;
+
+    var test_restr = "name: *(.*)\\((.*)\\)$";
+    var compiled = try ReParser.compile(test_restr, alloc);
+    try compiled.pretty_print(print);
+
+    var find = try re_find_once(test_restr, "date: 2077-06-24 name: adam jensen(occupation: killa)\n", alloc);
+    defer find.deinit(); // find has an arraylist of regex objects, this should be de-initialized when out of scope.
+
+    print("find = '{s}':\n", .{find.text}); //
+    print("find = '{s}':\n", .{find.groups.items[0].text});
+    try expect(find.groups.items[0].text.len == "adam jensen".len);
+    std.debug.assert(std.mem.eql(u8, "adam jensen", find.groups.items[0].text));
 }
