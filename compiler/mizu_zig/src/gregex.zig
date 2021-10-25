@@ -24,14 +24,14 @@ pub fn re_find_once(re_str: []const u8, src: []const u8, allocator: *std.mem.All
 test "usecase_simple" {
     const should_print: bool = true;
     const print = if (should_print) std.debug.print else test_noprint;
-    var alloc = std.heap.page_allocator;
+    var alloc = std.testing.allocator;
 
     var test_restr = "name: *(.*)\\(.*\\)$";
 
     var find = try re_find_once(test_restr, "date: 2077-06-24 name: adam jensen (occupation: killa)\n", alloc);
     defer find.deinit(); // find has an arraylist of regex objects, this should be de-initialized when out of scope.
 
-    print("find = '{s}':\n", .{find.text}); // the whole find string (this includes the end of line string)
+    print("find = '{s}{s}':\n", .{ find.text[0 .. find.text.len - 1], "\n" }); // the whole find string (this includes the end of line string)
     print("find = '{s}':\n", .{find.groups.items[0].text});
     try expect(find.groups.items[0].text.len == "adam jensen ".len);
     std.debug.assert(std.mem.eql(u8, "adam jensen ", find.groups.items[0].text));
@@ -61,6 +61,24 @@ const GRegexObject = struct {
             repeat_count: u32,
         },
     },
+
+    pub fn deinit(self: *GRegexObject) void {
+        switch (self.inner) {
+            .orgroup, .matchGroup => |*inner| {
+                for (inner.items) |*regex_obj| {
+                    regex_obj.deinit();
+                }
+                inner.deinit();
+            },
+            .repeatingGroup => |*inner| {
+                for (inner.group.items) |*regex_obj| {
+                    regex_obj.deinit();
+                }
+                inner.group.deinit();
+            },
+            else => {},
+        }
+    }
 
     pub fn make_match_group(allocator: *std.mem.Allocator) ReCompileObjectError!GRegexObject {
         var rv: GRegexObject = .{ .inner = .{ .matchGroup = ArrayList(GRegexObject).init(allocator) } };
@@ -142,8 +160,8 @@ const GRegexObject = struct {
         return regex_obj;
     }
 
-    pub fn make_orgroup(alloc: *std.mem.Allocator) GRegexObject {
-        var push_obj: GRegexObject = .{ .inner = .{ .orgroup = ArrayList(GRegexObject).init(alloc) } };
+    pub fn make_orgroup(allocator: *std.mem.Allocator) GRegexObject {
+        var push_obj: GRegexObject = .{ .inner = .{ .orgroup = ArrayList(GRegexObject).init(allocator) } };
         return push_obj;
     }
 
@@ -470,14 +488,11 @@ const ReParser = struct {
     allocator: *std.mem.Allocator,
 
     pub fn deinit(self: *ReParser) void {
-        for (self.sequence_mem) |regex_obj| {
-            switch (regex_obj.inner) {
-                .orgroup => |inner| inner.deinit(),
-                .matchGroup => |inner| inner.deinit(),
-                else => {},
-            }
+        for (self.sequence_mem) |*regex_obj| {
+            regex_obj.deinit();
         }
         self.allocator.free(self.sequence_mem);
+        self.len = 0;
     }
 
     pub fn handle_resize(self: *ReParser, new_size: usize) !void {
@@ -738,7 +753,6 @@ const ReParser = struct {
     pub fn parse_spec(self: *ReParser, spec: []const u8) !void {
         const print = std.debug.print;
         var pos: usize = 0;
-        // compile it via walking right and expanding a window
         var ctx: ReParserBuilderContext = .{ .pos = 0, .spec = spec };
         while (ctx.pos < ctx.spec.len) : (ctx.pos += 1) {
             var spec_obj = try self.make_regex_obj_from_ctx(&ctx, null);
@@ -754,7 +768,7 @@ const ReParser = struct {
     }
 
     pub fn compile(spec: []const u8, allocator: *std.mem.Allocator) !ReParser {
-        var alloc_ptr: []GRegexObject = try allocator.alloc(GRegexObject, 22);
+        var alloc_ptr: []GRegexObject = try allocator.alloc(GRegexObject, 32);
         var rv = ReParser{ .sequence_mem = alloc_ptr, .allocator = allocator, .spec = spec };
         try rv.parse_spec(spec);
         return rv;
@@ -900,14 +914,45 @@ fn test_noprint(comptime fmt: []const u8, args: anytype) void {
     // this is a no-print used for testing
 }
 
-fn test_compile_inner(src: []const u8, alloc: *std.mem.Allocator, comptime should_print: bool) !void {
-    var compiled = try ReParser.compile(src, alloc);
+fn leak_detection(allocator: *std.mem.Allocator) !void {
+    const should_print: bool = false;
+    const print = if (should_print) std.debug.print else test_noprint;
+
+    var test_restr = "date: *([\\d\\-]*) name: *(.*)\\((.*)\\)$";
+    var compiled = try ReParser.compile(test_restr, allocator);
+    defer compiled.deinit();
+    if (should_print) try compiled.pretty_print(print);
+
+    var find = try re_find_once(test_restr, "date: 2077-06-24 name: adam jensen(occupation: killa)\n", allocator);
+    defer find.deinit(); // find has an arraylist of regex objects, this should be de-initialized when out of scope.
+
+    std.debug.assert(find.is_match);
+    try expect(find.groups.items[1].text.len == "adam jensen".len);
+    std.debug.assert(std.mem.eql(u8, "adam jensen", find.groups.items[1].text));
+
+    try expect(find.groups.items[0].text.len == "2077-06-24".len);
+    std.debug.assert(std.mem.eql(u8, "2077-06-24", find.groups.items[0].text));
+}
+
+test "gpa leak detection" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked) expect(false) catch @panic("TEST FAIL");
+    }
+
+    try leak_detection(std.testing.allocator);
+}
+
+fn test_compile_inner(src: []const u8, allocator: *std.mem.Allocator, comptime should_print: bool) !void {
+    var compiled = try ReParser.compile(src, allocator);
     defer compiled.deinit();
     try compiled.pretty_print(if (should_print) std.debug.print else test_noprint);
 }
 
-pub fn test_nomatch(re_str: []const u8, test_str: []const u8, alloc: *std.mem.Allocator) !void {
-    var compiled = try ReParser.compile(re_str, alloc);
+pub fn test_nomatch(re_str: []const u8, test_str: []const u8, allocator: *std.mem.Allocator) !void {
+    var compiled = try ReParser.compile(re_str, allocator);
     defer compiled.deinit();
     var match = try compiled.findstr_once(test_str);
     if (match.len > 0) {
@@ -953,7 +998,7 @@ test "ipc_testing_match_groups" {
     const print = if (should_print) std.debug.print else test_noprint;
     defer print("/end \n", .{});
     print("\n", .{});
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = &arena.allocator;
 
@@ -1080,10 +1125,7 @@ test "ipc_compile_regex" {
 test "ipc_compile_regex_with_groups" {
     const should_print: bool = false;
     const print = if (should_print) std.debug.print else test_noprint;
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    var alloc = &arena.allocator;
-
-    defer arena.deinit();
+    var alloc = std.testing.allocator;
 
     try test_compile_inner("(wu)tang", alloc, should_print);
     try test_compile_inner("(wu)tang (2mercy)", alloc, should_print);
@@ -1107,10 +1149,11 @@ test "ipc_compile_and_use_group_regex" {
 test "epc_groups_and_conditionals" {
     const should_print: bool = false;
     const print = if (should_print) std.debug.print else test_noprint;
-    var alloc = std.heap.page_allocator;
+    var alloc = std.testing.allocator;
 
     var test_restr = "date: *([\\d\\-]*) name: *(.*)\\((.*)\\)$";
     var compiled = try ReParser.compile(test_restr, alloc);
+    defer compiled.deinit();
     if (should_print) try compiled.pretty_print(print);
 
     var find = try re_find_once(test_restr, "date: 2077-06-24 name: adam jensen(occupation: killa)\n", alloc);
@@ -1118,9 +1161,6 @@ test "epc_groups_and_conditionals" {
 
     std.debug.assert(find.is_match);
 
-    print("find = '{s}':\n", .{find.text}); //
-    print("find[0] = '{s}':\n", .{find.groups.items[0].text});
-    print("find[1] = '{s}':\n", .{find.groups.items[1].text});
     try expect(find.groups.items[1].text.len == "adam jensen".len);
     std.debug.assert(std.mem.eql(u8, "adam jensen", find.groups.items[1].text));
 
